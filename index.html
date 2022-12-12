@@ -1,0 +1,777 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <title>Path Tracing</title>
+        <style>
+            body {
+                background-color: black;
+                color: white;
+                font-family: monospace;
+                display: flex;
+            }
+
+            #maincanvas {
+                display: flex;
+                background-color: rgb(0, 0, 0);
+                width: 680px;
+                height: 680px;
+                border-color: white;
+                border-width: 2px;
+                border-style: solid;
+            }
+
+            .slider {
+                -webkit-appearance: none;
+                overflow: hidden;
+                width: 30vh;
+                margin: 16px;
+                background-color: #222222;
+            }
+
+            .slider::-webkit-slider-runnable-track {
+                height: 10px;
+                -webkit-appearance: none;
+                color: brown;
+                margin-top: -1px;
+            }
+  
+            .slider::-webkit-slider-thumb {
+                width: 10px;
+                -webkit-appearance: none;
+                height: 10px;
+                cursor: ew-resize;
+                background: #686868;
+                box-shadow: -160px 0 0 160px brown;
+            }
+
+            .redText {
+                color: red;
+            }
+
+            .greenText {
+                color: greenyellow;
+            }
+
+            .controls {
+                margin: 1em;
+            }
+        </style>
+    </head>
+    <body>
+        <canvas id="maincanvas" width="680" height="680"></canvas>
+        <div class="controls">
+            <div>Press R to toggle recording<span id="recording" class="redText" hidden> [REC]</span></div><br>
+            <div id="samples">Samples: 0</div>
+            <div id="camera">Showing camera: 1 of 4</div>
+            <div id="bouncesText">Bounces: 5</div>
+            <div id="importance">Importance Sampling <span class="greenText">Enabled</span> (Press I to disable)</div>
+            <br>
+            <table class="sliders">
+                <tr><td><span>Bounces: </span></td><td><input type="range" min="0" max="10" value="5" class="slider" id="bounces" oninput='bouncesSetting = +document.getElementById("bounces").value; invalidated = true; setTimeout(() => draw(null, cameraSensitivity), 0);'></td></tr>
+                <tr><td><span>Blur: </span></td><td><input type="range" min="0" max="100" value="0" class="slider" id="blur" oninput='document.getElementById("maincanvas").style.filter = "blur(" + ((+document.getElementById("blur").value) / 10) + "px)";'></td></tr>
+                <tr><td><span>ISO: </span></td><td><input type="range" min="1" max="40" value="15" class="slider" id="cameraSensitivity" oninput='cameraSensitivity = +document.getElementById("cameraSensitivity").value;'></td></tr>
+            </table>       
+        </div>
+        <script>
+
+            var bouncesSetting = +document.getElementById("bounces").value;
+            var cameraSensitivity = +document.getElementById("cameraSensitivity").value;
+            var pause = true;
+            var invalidated = false;
+            var importanceSampling = true;
+            var recording = false;
+
+            const canvas = document.getElementById("maincanvas");
+            const ctx = canvas.getContext("2d");
+
+            function downloadPNG(canvas, name) {
+                const videoURL = canvas.toDataURL("image/png");
+                const link = document.createElement("a");
+
+                link.href = videoURL;
+                link.download = name;
+                document.body.appendChild(link);
+
+                link.dispatchEvent(
+                    new MouseEvent('click', { 
+                        bubbles: true, 
+                        cancelable: true, 
+                        view: window 
+                    })
+                );
+
+                document.body.removeChild(link);
+            };
+
+            window.onkeydown = function(e) {
+                if (!isNaN(+e.key) && +e.key > 0 && +e.key <= 4) {
+                    mainScene.renderingCameraIndex = (+e.key) - 1;
+                    invalidated = true;
+                }
+                if (e.key === "p") {
+                    pause = !pause;
+                }
+                if (e.key === "i") {
+                    importanceSampling = !importanceSampling;
+                    invalidated = true;
+                    setTimeout(() => draw(null, cameraSensitivity), 0);
+                }
+                if (e.key === "r") {
+                    if (recording) {
+                        pause = true;
+                        recording = false;
+                        document.getElementById("recording").hidden = true;
+                    } else {
+                        pause = false;
+                        recording = true;
+                        document.getElementById("recording").hidden = false;
+                    }
+                }
+            }
+
+            function dot(a, b) {
+                return a.x * b.x + a.y * b.y + a.z * b.z;
+            }
+
+            function cross(a, b) {
+                return {
+                    x: a.y*b.z - a.z*b.y,
+                    y: a.z*b.x - a.x*b.z,
+                    z: a.x*b.y - a.y*b.x
+                };
+            }
+
+            function scale(s, v) {
+                return {
+                    x: s * v.x,
+                    y: s * v.y,
+                    z: s * v.z
+                }
+            }
+
+            function sum(a, b) {
+                return {
+                    x: a.x+b.x,
+                    y: a.y+b.y,
+                    z: a.z+b.z
+                };
+            }
+
+            function negate(a) {
+                return {
+                    x: -a.x,
+                    y: -a.y,
+                    z: -a.z
+                };
+            }
+
+            function diff(a, b) {
+                return sum(a, negate(b));
+            }
+
+            function normalize(a) {
+                let module = Math.sqrt(dot(a, a));
+                if (module < 1e-10) {
+                    console.error("Error normalizing zero vector: ", a);
+                    return a;
+                }
+                return scale(1.0 / module, a);
+            }
+
+            function rotate(x, u, theta) {
+                let uXx = cross(u, x);
+                return sum(sum(scale(dot(x, u), u), scale(Math.cos(theta), cross(uXx, u))), scale(Math.sin(theta), uXx));
+            }
+
+            function closerThan(a, b, dist) {
+                let d = diff(a, b);
+                return dot(d, d) < dist * dist;
+            }
+
+            function angleToDirection(normal, phi, theta) {
+                const tang = normalize((Math.abs(normal.x) > 1e-10) ? {x: normal.y, y: -normal.x, z: 0} : {x: 0, y: normal.z, z: -normal.y});
+                return rotate(normal, cross(normal, rotate(tang, normal, phi)), theta);
+            }
+
+            function reflectionDirection(normal, incoming) {
+                return diff(incoming, scale(2*dot(incoming, normal), normal));
+            }
+
+
+            function simpleBounce(point, normal, incomingRay) {
+                const phi = 2*Math.PI*Math.random();
+                const theta = Math.acos(Math.random());
+                return {
+                    p: point,
+                    d: angleToDirection(normal, phi, theta),
+                    weight: Math.cos(theta)
+                }
+            }
+
+            function diffuseImportanceBounce(point, normal, incomingRay, reflectance) {
+                const phi = 2*Math.PI*Math.random();
+                const theta = Math.acos(Math.sqrt(Math.random()));
+                return {
+                    p: point,
+                    d: angleToDirection(normal, phi, theta),
+                    weight: reflectance
+                }
+            }
+
+            function specularImportanceBounce(point, reflectionDirection, specularGlow, reflectance) {
+                const n = specularGlow;
+                const phi = 2*Math.PI*Math.random();
+                const theta = Math.acos(Math.pow(Math.random(), 1.0 / (1.0 + n)));
+                const newRayDir = angleToDirection(reflectionDirection, phi, theta);
+                return {
+                    p: point,
+                    d: newRayDir,
+                    weight: reflectance
+                }
+            }
+
+            function phongMaterial(color, emittance, diffuse, specular, specularGlow) {
+                return {
+                    color: color,
+                    emittance: emittance,
+                    diffuseReflectivity: diffuse,
+                    specularReflectivity: specular,
+                    specularGlow: specularGlow,
+                    brdf: phongBRDF,
+                    bounce: function(point, normal, incomingRay) {
+                        if (!importanceSampling) {
+                            return simpleBounce(point, normal, incomingRay);
+                        }
+                        const totalR = diffuse + specular;
+                        const selector = Math.random() * totalR;
+                        const phi = 2*Math.PI*Math.random();
+                        if (selector < diffuse) {
+                            return diffuseImportanceBounce(point, normal, incomingRay, diffuse);
+                        } else {
+                            const reflectionDir = normalize(reflectionDirection(normal, incomingRay.d));
+                            return specularImportanceBounce(point, reflectionDir, specularGlow, specular);
+                        }
+                    }
+                }
+            }
+
+            function ray(p, d) {
+                return {p: p, d: d, type: "ray"}
+            }
+
+            function plane(p, n, material) {
+                return {
+                    p: p,
+                    n: normalize(n),
+                    type: "plane",
+                    normalAt: function(point) {
+                        return n;
+                    },
+                    hitBy: function(ray) {
+                        return rayHitPlane(ray, n, p);
+                    },
+                    material: material
+                }
+            }
+
+            const NO_HIT = { hit: false };
+
+            function rect(p, n, dh, w, h, material) {
+                return {
+                    p: p,
+                    n: normalize(n),
+                    dh: normalize(dh),
+                    dw: normalize(cross(dh, n)),
+                    w: w,
+                    h: h,
+                    type: "rect",
+                    normalAt: function(point) {
+                        return n;
+                    },
+                    hitBy: function(ray) {
+                        let planeHit = rayHitPlane(ray, n, p);
+                        if (planeHit.hit) {
+                            let v = diff(planeHit.point, obj.p);
+                            let pw = dot(v, obj.dw);
+                            let ph = dot(v, obj.dh);
+                            if (pw > -obj.w/2 && pw < obj.w/2 && ph > -obj.h/2 && ph < obj.h/2) {
+                                return planeHit;
+                            }
+                        }
+                        return NO_HIT;
+                    },
+                    material: material
+                }
+            }
+
+            function disc(p, n, r, material) {
+                return {
+                    p: p,
+                    n: normalize(n),
+                    r: r,
+                    type: "disc",
+                    normalAt: function(point) {
+                        return n;
+                    },
+                    hitBy: function(ray) {
+                        let planeHit = rayHitPlane(ray, n, p);
+                        if (planeHit.hit && closerThan(obj.p, planeHit.point, obj.r)) {
+                            return planeHit;
+                        }
+                        return NO_HIT;
+                    },
+                    material: material
+                }
+            }
+
+            function sphere(p, r, material) {
+                return {
+                    p: p,
+                    r: r,
+                    type: "sphere",
+                    normalAt: function(point) {
+                        let v = diff(point, p);
+                        return scale(1 / Math.sqrt(dot(v, v)), v);
+                    },
+                    hitBy: function(ray) {
+                        let d = diff(ray.p, p);
+                        let a = dot(ray.d, ray.d);
+                        let b = 2 * dot(ray.d, d);
+                        let c = dot(p, p) + dot(ray.p, ray.p) - 2 * dot(p, ray.p) - r * r;
+                        let delta = discriminant(a, b, c);
+                        if (delta > 0) {
+                            let t = ((-b) - Math.sqrt(delta)) / (2 * a);
+                            let p = sum(ray.p, scale(t, ray.d));
+                            return {
+                                hit: t > 0,
+                                point: p,
+                                normal: this.normalAt(p),
+                                t: t
+                            }
+                        }
+                        return NO_HIT;
+                    },
+                    material: material
+                }
+            }
+
+            function camera(p, d, sdh, sw, sh, w, h) {
+                return {
+                    p: p,
+                    d: d,
+                    type: "camera",
+                    sensor: {
+                        dw: negate(normalize(cross(sdh, d))),
+                        dh: normalize(sdh),
+                        w: sw,
+                        h: sh
+                    },
+                    resolution: {
+                        w: w,
+                        h: h
+                    },
+                    normalAt: function(point) {
+                        return {x: 0, y: 0, z: 1};
+                    },
+                    hitBy: function(ray) {
+                        return NO_HIT;
+                    },
+                    material: phongMaterial(BLACK, BLACK, 0, 0, 0)
+                }
+            }
+
+            function cameraRay(camera, pixelX, pixelY, rndX, rndY) {
+                let wr = (pixelX + rndX) / camera.resolution.w;
+                let hr = 1.0 - (pixelY + rndY) / camera.resolution.h;
+                let screenCenter = sum(camera.p, camera.d);
+                let screenPoint = sum(
+                    sum(screenCenter, scale((wr-0.5) * camera.sensor.w, camera.sensor.dw)),
+                        scale((hr-0.5) * camera.sensor.h, camera.sensor.dh));
+                let direction = normalize(diff(screenPoint, camera.p));
+                return ray(camera.p, direction);
+            }
+
+            const BLACK = {r: 0.0, g: 0.0, b: 0.0, a: 1.0, intensity: 0.0};
+
+            function incrementPixel(pixels, x, y, w, color) {
+                pixels[y * w * 4 + x * 4 + 0] += color.r;
+                pixels[y * w * 4 + x * 4 + 1] += color.g;
+                pixels[y * w * 4 + x * 4 + 2] += color.b;
+                pixels[y * w * 4 + x * 4 + 3] += color.a;
+            }
+
+            function handleUIEvents () {
+                return new Promise((ok,err) => setTimeout(ok,0));
+            }
+
+            async function render(scene, w, h, bounces, previousRender) {
+                let result = previousRender;
+                let foundCameras = 0;
+                for (let obj of scene.objects) {
+                    if (obj.type === "camera") {
+                        foundCameras++;
+                        if ((foundCameras-1) === scene.renderingCameraIndex) {
+                            break;
+                        }
+                    }
+                }
+                if (foundCameras === 0) {
+                    console.error("Camera found in scene, camera index: ", foundCameras-1);
+                    return previousRender;
+                }
+                let camera = scene.objects[foundCameras-1];
+                if (previousRender == null) {
+                    result = {
+                        pixels: new Float64Array(w * h * 4),
+                        samplesPerPixel: 0
+                    };
+                }
+                let tenPercentW = Math.floor(w*0.1);
+                for (let x = 0; x < w; x++) {
+                    if (x % tenPercentW == 0) {
+                        await handleUIEvents();
+                        if (invalidated) {
+                            invalidated = false;
+                            return null;
+                        }
+                    }
+                    for (let y = 0; y < h; y++) {
+                        let dx = Math.random();
+                        let dy = Math.random();
+                        let ray = cameraRay(camera, x, y, dx, dy);
+                        let color = trace(scene, ray, 0, bounces);
+                        incrementPixel(result.pixels, x, y, w, color);
+                    }
+                }
+                result.samplesPerPixel += 1;
+                result.w = w;
+                result.h = h;
+                return result;
+            }
+
+            function findClosestHit(scene, ray) {
+                let closestHit = null;
+                let closestObj = null;
+                for (obj of scene.objects) {
+                    if (obj.hitBy) {
+                        let rayHit = obj.hitBy(ray);
+                        if (rayHit.hit) {
+                            if (closestHit == null || rayHit.t < closestHit.t) {
+                                closestHit = rayHit;
+                                closestObj = obj;
+                            }
+                        }
+                    }
+                }
+                if (closestObj == null) {
+                    return null;
+                }
+                return {
+                    obj: closestObj,
+                    rayHit: closestHit
+                };
+            }
+
+            function trace(scene, ray, currentBounce, maxBounces) {
+                if (currentBounce >= maxBounces) {
+                    return BLACK;
+                }
+                const closestHit = findClosestHit(scene, ray);
+                if (closestHit != null) {
+                    const obj = closestHit.obj;
+                    const rayHit = closestHit.rayHit;
+                    const objNormal = obj.normalAt(rayHit.point);
+                    const newRay = obj.material.bounce(rayHit.point, objNormal, ray);
+                    if (newRay == null) {
+                        return {
+                            r: obj.material.emittance.r * obj.material.emittance.intensity,
+                            g: obj.material.emittance.g * obj.material.emittance.intensity,
+                            b: obj.material.emittance.b * obj.material.emittance.intensity,
+                            a: 1.0
+                        };
+                    }
+                    const cosine = dot(newRay.d, objNormal);
+                    let brdf = 1.0;
+                    let p = 1.0;
+                    if (!importanceSampling) {
+                        brdf = obj.material.brdf(obj.material, Math.acos(cosine));
+                        p = 1 / Math.PI;
+                    }
+                    const emittance = obj.material.emittance;
+                    const incoming = trace(scene, newRay, currentBounce + 1, maxBounces);
+                    const factor = brdf * newRay.weight / p;
+                    return {
+                        r: obj.material.emittance.r * obj.material.emittance.intensity + factor * obj.material.color.r * incoming.r,
+                        g: obj.material.emittance.g * obj.material.emittance.intensity + factor * obj.material.color.g * incoming.g,
+                        b: obj.material.emittance.b * obj.material.emittance.intensity + factor * obj.material.color.b * incoming.b,
+                        a: incoming.a
+                    };
+                }
+                return BLACK;
+            }
+
+            function phongBRDF(material, angle) {
+                let n = material.specularGlow;
+                let d = material.diffuseReflectivity;
+                let s = material.specularReflectivity;
+                return d * (1.0 / Math.PI) + s * (((n + 2) / (2 * Math.PI)) * Math.pow(Math.cos(angle), n));
+            }
+
+            function rayHitPlane(ray, n, p) {
+                let denom = dot(n, ray.d); 
+                if (denom < -1e-5) { 
+                    let rayStartToPlaneCenter = diff(p, ray.p);
+                    let t = dot(rayStartToPlaneCenter, n) / denom;
+                    if (t > 0) {
+                        return {
+                            hit: t > 0,
+                            point: sum(ray.p, scale(t, ray.d)),
+                            normal: n,
+                            t: t
+                        }; 
+                    }
+                }
+                return { hit: false };
+            }
+
+            function discriminant(a, b, c) {
+                return b*b - 4*a*c;
+            }
+
+            let currentRender = null;
+
+            function draw(renderData, cameraSensitivity) {
+                let imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                let w = imageData.width;
+                let h = imageData.height;
+                let bytesCount = w * h * 4;
+                if (renderData && renderData.w === w && renderData.h === h) {
+                    let data = imageData.data;
+                    for (let i = 0; i < bytesCount; i++) {
+                        if (i % 4 == 3) {
+                            data[i] = 255; // Alpha channel
+                        } else {
+                            data[i] = Math.floor(Math.max(0, Math.min(255, 20 * Math.log(1.0 + Math.pow(2, cameraSensitivity) * renderData.pixels[i] / renderData.samplesPerPixel))));
+                        }
+                    }
+                    ctx.putImageData(imageData, 0, 0);
+                } else {
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                }
+            }
+
+            function box(center, size, material, angle = 0.0) {
+                const halfSize = size / 2;
+                const planes = [
+                    {x: halfSize, y: 0, z: 0},
+                    {x: -halfSize, y: 0, z: 0},
+                    {x: 0, y: halfSize, z: 0},
+                    {x: 0, y: -halfSize, z: 0},
+                    {x: 0, y: 0, z: halfSize},
+                    {x: 0, y: 0, z: -halfSize}
+                ].map(plane => rotate(plane, {x: 0, y: 0, z: 1}, angle));
+                let pickdh = function(normal) {
+                    if (Math.abs(normal.z) > 1e-10) {
+                        return cross(normal, rotate({x: 1.0, y: 0.0, z: 0.0}, {x: 0, y: 0, z: 1}, angle));
+                    } else {
+                        return cross(normal, {x: 0.0, y: 0.0, z: 1.0});
+                    }
+                }
+                return planes.map(plane => rect(
+                        sum(center, plane),
+                        normalize(plane),
+                        pickdh(normalize(plane)),
+                        size,
+                        size,
+                        material));
+            }
+
+            function room(center, size, floorMaterial, wallMaterial) {
+                const boxSides = box(center, size, wallMaterial);
+                return boxSides.map((wall, i) => rect(
+                    wall.p, negate(wall.n), wall.dh, wall.w, wall.h, (i == boxSides.length - 1) ? floorMaterial : wall.material
+                ));
+            }
+
+            function update() {
+                if (!pause) {
+                    document.getElementById("samples").innerText = document.getElementById("samples").innerText.replace(" (Paused)", "");
+                    currentRenderPromise = render(mainScene, canvas.width, canvas.height, bouncesSetting + 1, currentRender);
+                    currentRenderPromise.then(result => {
+                        currentRender = result;
+                        let drawPromise = new Promise((resolve, reject) => {
+                            draw(currentRender, cameraSensitivity);
+                            resolve();
+                        });
+                        if (result != null) {
+                            document.getElementById("samples").innerText = "Samples: " + currentRender.samplesPerPixel;
+                            if (recording && (currentRender.samplesPerPixel % 10 === 0 || currentRender.samplesPerPixel === 1)) {
+                                const name = "camera_" + (mainScene.renderingCameraIndex+1) + "_samples_" + currentRender.samplesPerPixel + "_bounces_" + bouncesSetting + (importanceSampling ? "_i" : "") + ".png";
+                                drawPromise.then(() => downloadPNG(canvas, name));
+                            }
+                        } else {
+                            document.getElementById("samples").innerText = "Samples: 0";
+                        }
+                        setTimeout(update, 0);
+                    });
+                } else {
+                    if (!document.getElementById("samples").innerText.includes(" (Paused, press P to run)")) {
+                        document.getElementById("samples").innerText += " (Paused, press P to run)";
+                    }
+                    setTimeout(update, 100);
+                }
+                document.getElementById("camera").innerText = "Showing camera: " + (mainScene.renderingCameraIndex+1) + " of 4";
+                document.getElementById("importance").innerHTML = "Importance Sampling " + (importanceSampling ? '<span class="greenText">Enabled</span> ' : ' <span class="redText">Disabled</span>') + " (Press I to " + (importanceSampling ? "disable) " : " enable)");
+                document.getElementById("bouncesText").innerHTML = "Bounces: " + bouncesSetting;
+            }
+
+            let mainScene = {
+                renderingCameraIndex: 0,
+                objects: [
+                    camera(
+                        {x: 0, y: -9, z: 10},
+                        {x: 0, y: 10, z: -1},
+                        {x: 0, y: 0.1, z: 1},
+                        15, 15, canvas.width, canvas.height),
+
+                    camera(
+                        {x: -5, y: 0, z: 3},
+                        {x: 10, y: 6, z: -1},
+                        {x: 0.1, y: 0, z: 1},
+                        4, 4, canvas.width, canvas.height),
+                    
+                    camera(
+                        {x: -5, y: 9, z: 3},
+                        {x: 10, y: -3, z: -1},
+                        {x: 0, y: 0, z: 1},
+                        6, 6, canvas.width, canvas.height),
+
+                    camera(
+                        {x: 0, y: 0, z: 19.9},
+                        {x: 0, y: 0, z: -10},
+                        {x: 0, y: 1, z: 0},
+                        15, 15, canvas.width, canvas.height),
+
+                    sphere(
+                        {x: -5, y: 6, z: 2},
+                        2.0,
+                        phongMaterial(
+                            {r: 0.0, g: 0.0, b: 0.0, a: 1.0},
+                            {r: 1.0, g: 1.0, b: 1.0, intensity: 1},
+                            0.0,
+                            0.0,
+                            0.0
+                        )
+                    ),
+
+                    sphere(
+                        {x: 5, y: 6, z: 0.5},
+                        0.5,
+                        phongMaterial(
+                            {r: 0.0, g: 0.0, b: 0.0, a: 1.0},
+                            {r: 1.0, g: 1.0, b: 1.0, intensity: 1},
+                            0.0,
+                            0.0,
+                            0.0
+                        )
+                    ),
+
+                    sphere(
+                        {x: 7, y: 7, z: 2},
+                        2,
+                        phongMaterial(
+                            {r: 1.0, g: 1.0, b: 1.0, a: 1.0},
+                            {r: 0.0, g: 0.0, b: 0.0, intensity: 0.0},
+                            0.01,
+                            0.1,
+                            2000000
+                        )
+                    ),
+
+                    box(
+                        {x: 7, y: 3, z: 1},
+                        2.0,
+                        phongMaterial(
+                            {r: 0.3, g: 1.0, b: 0.5, a: 1.0},
+                            {r: 0.5, g: 1.0, b: 0.3, intensity: 0.0},
+                            0.2,
+                            0.05,
+                            10
+                        )
+                    ),
+
+                    box(
+                        {x: 6.8, y: 3.3, z: 2.5},
+                        1.0,
+                        phongMaterial(
+                            {r: 0.8, g: 0.2, b: 1.0, a: 1.0},
+                            {r: 0.1, g: 1.0, b: 0.3, intensity: 0.0},
+                            0.2,
+                            0.05,
+                            10
+                        )
+                    ),
+
+                    box(
+                        {x: 6.8, y: 3.3, z: 3.4},
+                        0.8,
+                        phongMaterial(
+                            {r: 1.0, g: 1.0, b: 1.0, a: 1.0},
+                            {r: 0.1, g: 1.0, b: 0.3, intensity: 0.0},
+                            0.0,
+                            0.5,
+                            10
+                        )
+                    ),
+
+                    box(
+                        {x: -5, y: -7, z: 1},
+                        2.0,
+                        phongMaterial(
+                            {r: 0.1, g: 0.4, b: 1.0, a: 1.0},
+                            {r: 0.5, g: 1.0, b: 0.3, intensity: 0.0},
+                            0.2,
+                            0.05,
+                            10
+                        )
+                    ),
+
+                    rect(
+                        {x: -3.0, y: 9.99, z: 4.0},
+                        {x: 0.0, y: -1.0, z: 0.0},
+                        {x: 0.0, y: 0.0, z: 1.0},
+                        6.0,
+                        6.0,
+                        phongMaterial(
+                            {r: 1.0, g: 1.0, b: 1.0, a: 1.0},
+                            {r: 0.0, g: 0.0, b: 0.0, intensity: 0.0},
+                            0.01,
+                            0.1,
+                            2000000
+                    )),
+                    
+                    room(
+                        {x: 0, y: 0, z: 10},
+                        20.0,
+                        phongMaterial(
+                            {r: 1.0, g: 0.5, b: 0.3, a: 1.0},
+                            {r: 1.0, g: 1.0, b: 1.0, intensity: 0.0},
+                            0.05,
+                            0.2,
+                            50.0
+                        ),
+                        phongMaterial(
+                            {r: 1.0, g: 0.5, b: 0.3, a: 1.0},
+                            {r: 1.0, g: 1.0, b: 1.0, intensity: 0.0},
+                            0.2,
+                            0.05,
+                            10.0
+                        )
+                    )
+            ].flatMap(x => x)};
+
+            update();
+
+        </script>
+    </body>
+</html>

@@ -1,0 +1,1 @@
+This is a naive implementation of the "Path Tracing" rendering algorithm with Importance Sampling, developed for the Helsinki University Modern Science course.
